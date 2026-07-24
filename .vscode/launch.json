@@ -1,0 +1,30 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "probe-rs-debug",
+            "request": "launch",
+            "name": "Debug STM32F3",
+            "chip": "STM32F303VCTx",
+            "flashingConfig": {
+                "flashingEnabled": true,
+                "haltAfterReset": true
+            },
+            "coreConfigs": [
+                {
+                    "coreIndex": 0,
+                    "programBinary": "${workspaceFolder}/target/thumbv7em-none-eabihf/debug/rt-interrupts",
+                    "rttArgs": {
+                        "enabled": true,
+                        "channels": [
+                            {
+                                "channel": 0,
+                                "format": "String"
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+    ]
+}
