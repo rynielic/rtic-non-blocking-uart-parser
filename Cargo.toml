@@ -11,4 +11,3 @@ stm32f3xx-hal = { version = "0.10", features = ["stm32f303xc", "rt"] }
 defmt = "0.3"
 defmt-rtt = "0.4"
 panic-probe = { version = "0.3", features = ["print-defmt"] }
-embedded-hal = "1.0.0"
