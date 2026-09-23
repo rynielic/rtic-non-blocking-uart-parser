@@ -7,9 +7,11 @@ use panic_probe as _;
 #[rtic::app(device = stm32f3xx_hal::pac, dispatchers = [SPI1])]
 mod app {
       use cortex_m::singleton;
+      use defmt::println;
       use stm32f3xx_hal::{
-            dma::{Channel, Direction::FromPeripheral, Increment::{Disable, Enable}, Target}, gpio::Edge, pac::USART1, prelude::*, serial::{Event, Serial},
+            dma::{Channel, Direction::FromPeripheral, Increment::{Disable, Enable}, Target}, gpio::Edge, pac::{DMA1, USART1}, prelude::*, serial::{Event, Serial},
       };
+      use embedded_hal::*;
 
       type Uart1TxPin = stm32f3xx_hal::gpio::Pin<stm32f3xx_hal::gpio::Gpioa, stm32f3xx_hal::gpio::U<9>, stm32f3xx_hal::gpio::Alternate<stm32f3xx_hal::gpio::PushPull, 7>>;
       type Uart1RxPin = stm32f3xx_hal::gpio::Pin<stm32f3xx_hal::gpio::Gpioa, stm32f3xx_hal::gpio::U<10>, stm32f3xx_hal::gpio::Alternate<stm32f3xx_hal::gpio::PushPull, 7>>;
@@ -23,7 +25,9 @@ mod app {
             stop_button: StopButtonPin,
             uart1: Serial<USART1, (Uart1TxPin, Uart1RxPin)>,
             uart1_rx_channel: stm32f3xx_hal::dma::dma1::C5,
-            rx_buffer_ptr: *mut u8,
+            rx_buffer_addr: u32,
+            last_cndtr: u16,
+            rx_buffer_length: u16,
       }
 
       #[init]
@@ -35,7 +39,7 @@ mod app {
             // Clock
             let mut rcc = dp.RCC.constrain();
             let mut flash = dp.FLASH.constrain();
-            let mut clock = rcc.cfgr
+            let clock = rcc.cfgr
                   .use_hse(8.MHz())
                   .sysclk(72.MHz())
                   .pclk1(36.MHz())
@@ -78,13 +82,15 @@ mod app {
             let mut uart1_rx_channel= dma1.ch5;
             
             // DMA buffer
-            let mut rx_buffer: &'static mut [u8; 64] = singleton!(: [u8; 64] = [0;64]).unwrap();
-            let rx_buffer_ptr = rx_buffer.as_mut_ptr();
+            let rx_buffer: &'static mut [u8; 64] = singleton!(: [u8; 64] = [0;64]).unwrap();
+            let rx_buffer_length = rx_buffer.len() as u16;
+            let rx_buffer_addr = rx_buffer.as_mut_ptr() as u32;
+            let last_cndtr: u16;
 
             // DMA configuration
             unsafe {
                   uart1_rx_channel.set_peripheral_address(usart1_rdr, Disable);
-                  uart1_rx_channel.set_memory_address(rx_buffer_ptr as u32, Enable);
+                  uart1_rx_channel.set_memory_address(rx_buffer_addr, Enable);
                   uart1_rx_channel.set_transfer_length(rx_buffer.len() as u16);
                   uart1_rx_channel.set_word_size::<u8>();
                   uart1_rx_channel.set_direction(FromPeripheral);
@@ -92,27 +98,67 @@ mod app {
                   // Circ bit enabled
                   (*stm32f3xx_hal::pac::DMA1::ptr()).ch5.cr.modify(|_, w| w.circ().set_bit());
 
+                  last_cndtr = (*stm32f3xx_hal::pac::DMA1::ptr()).ch5.ndtr.read().ndt().bits();
+
                   // Prevents from compiler reordering  
                   core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
 
                   uart1_rx_channel.enable();
-                  
             }
-            
-            (Shared {}, Local {stop_button, uart1, uart1_rx_channel, rx_buffer_ptr})
+
+
+            (Shared {}, Local {stop_button, uart1, uart1_rx_channel, rx_buffer_addr, last_cndtr, rx_buffer_length})
       }
       
-      #[idle]
-      fn idle (_: idle::Context) -> ! {
+      #[idle(local = [uart1])]
+      fn idle (cx: idle::Context) -> ! {
+            let uart1 = cx.local.uart1;
+
+            let idle = unsafe { (*stm32f3xx_hal::pac::USART1::ptr()).isr.read().idle().bit_is_set() };
+            println!("idle interrupt is {}", idle);
+
+            println!("before write");
+            for &b in b"HI from idle\n" {
+                  nb::block!(uart1.write(b)).unwrap();
+            }
+            println!("after write");
+
             loop {
-                  // pwm works as a background task
+                  
             }
       }
 
-      #[task(binds = USART1_EXTI25, priority = 2)]
-      fn uart_rx (_: uart_rx::Context) {
-            // fills the uart buffer, if \n byte incomes,
-            // uart_paser.spawn()
+      #[task(binds = USART1_EXTI25, local = [last_cndtr, rx_buffer_length, rx_buffer_addr], priority = 2)]
+      fn uart_rx (cx: uart_rx::Context) {
+
+            // Clear USART1_IDLE interrupt 
+            unsafe { (*stm32f3xx_hal::pac::USART1::ptr()).icr.write(|w| w.idlecf().set_bit()) };
+            println!("uart_rx task started");
+
+            // Declare the locals
+            let last_cndtr = cx.local.last_cndtr;
+            let rx_buffer_length = *cx.local.rx_buffer_length;
+            let rx_buffer_addr = *cx.local.rx_buffer_addr;
+
+            // Unsafe to access the DMA1_CNDRT register 
+            let current_cndtr = unsafe { (*stm32f3xx_hal::pac::DMA1::ptr()).ch5.ndtr.read().ndt().bits() };
+
+            let delta = (*last_cndtr + rx_buffer_length - current_cndtr) % rx_buffer_length;
+            let mut cmd_buf = [0u8; 16];
+
+            for i in 0..delta {
+                  // Calculate the physical index in the buffer
+                  let index = (rx_buffer_length - *last_cndtr + i) % rx_buffer_length;
+                  
+                  // Perform a volatile read so the compiler doesn't cache stale memory
+                  let byte = unsafe { 
+                        let rx_buffer_ptr = (rx_buffer_addr as *const u8).add(index as usize);
+                        core::ptr::read_volatile(rx_buffer_ptr)
+                  };
+
+                  cmd_buf[i as usize] = byte;
+            }
+            uart_parser::spawn(cmd_buf, delta).unwrap();
       }
 
       #[task(binds = EXTI0, priority = 3)]
@@ -121,7 +167,23 @@ mod app {
       }
 
       #[task(priority = 1)]
-      async fn uart_parser(_: uart_parser::Context) {
-            // parsing uart buffer
+      async fn uart_parser(_: uart_parser::Context, cmd_buf: [u8; 16], length: u16) {
+            println!("got: {:?}", cmd_buf);
+            let mut count: usize = 0;
+
+            // parsing example
+            for i in b"HI from idle\n" {
+                  if *i == cmd_buf[count] {
+                        count += 1;
+                        if count as u16 == length {
+                              println!("success");
+                        }
+                  }
+                  else {
+                        println!("0");
+                        break;
+                  }
+                  
+            }
       }
 }
