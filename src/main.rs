@@ -47,10 +47,50 @@ mod app {
                         CommandError::InvalidArgument => "Error: Wrong argument!\r\n",
                         CommandError::ArgumentTooLong => "Error: Argument is too big!\r\n",
                         CommandError::UnknownCommand => "Error: Unknown command!\r\n",
-                        CommandError::PwmStopped => "Error: PWM is stopped. To continue enter RESUME\r\n",
+                        CommandError::PwmStopped => "Error: Unable to set value - PWM is stopped. To continue enter RESUME\r\n",
                         CommandError::BufferOverflow => "Error: Command too long, buffer cleared!\r\n",
                         CommandError::CommandBusy => "Error: Busy, command dropped\r\n"
                   }
+            }
+      }
+
+      enum ParsedCommand {
+            SetPwm(u8),
+            Stop,
+            Resume,
+            DropArg,
+            Status,
+            Error(CommandError),
+      }
+
+      fn parse_command (cmd_buf: &mut [u8; 16], length: u16) -> ParsedCommand {
+            cmd_buf.make_ascii_uppercase();
+
+            // Slice by amount of incomed bytes to strip excess bytes like '0' and '13'(b'\r')
+            let cmd: &[u8] = &cmd_buf[..length as usize - 1];
+      
+            if let Some(rest) = cmd.strip_prefix(b"SET_PWM(") {
+                  return match rest.iter().position(|br| *br == b')') {
+                        Some(finish) if finish == rest.len() - 1 => parse_pwm_argument(&rest[..finish]),
+                        _ => ParsedCommand::Error(CommandError::UnknownCommand)
+                  };
+            }
+            match cmd {
+                  b"STOP" => ParsedCommand::Stop,
+                  b"RESUME" => ParsedCommand::Resume,
+                  b"DROP_ARG" => ParsedCommand::DropArg,
+                  b"STATUS" => ParsedCommand::Status,
+                  _ => ParsedCommand::Error(CommandError::UnknownCommand),        
+            }
+      }
+      fn parse_pwm_argument(argument: &[u8]) -> ParsedCommand {
+            match argument {
+                  [] => ParsedCommand::Error(CommandError::EmptyArgument),
+                  [a] if a.is_ascii_digit() => ParsedCommand::SetPwm(a - b'0'),
+                  [a, b] if a.is_ascii_digit() && b.is_ascii_digit() => ParsedCommand::SetPwm((a - b'0')*10 + b - b'0'),
+                  [b'1', b'0', b'0'] => ParsedCommand::SetPwm(100),
+                  [_] | [_,_] | [_,_,_] => ParsedCommand::Error(CommandError::InvalidArgument), 
+                  _ => ParsedCommand::Error(CommandError::ArgumentTooLong), 
             }
       }
 
@@ -137,7 +177,6 @@ mod app {
             syscfg.select_exti_interrupt_source(&stop_button);
             stop_button.trigger_on_edge(&mut exti, Edge::Rising);
             stop_button.enable_interrupt(&mut exti);
-
             // DMA 1 channel 5
             let dma1 = dp.DMA1.split(&mut rcc.ahb);
             let mut uart1_rx_channel= dma1.ch5;
@@ -148,7 +187,7 @@ mod app {
             let rx_buffer_length = rx_buffer.len() as u16;
             let rx_buffer_addr = rx_buffer.as_mut_ptr() as u32;
             let last_cndtr: u16;
-
+ 
             // DMA configuration
             unsafe {
                   uart1_rx_channel.set_peripheral_address(usart1_rdr, Disable);
@@ -265,131 +304,61 @@ mod app {
 
       #[task(priority = 1, shared = [uart1, pwm_duty, pwm_change_flag, tim1_ch1, tim1_ch1_enabled])]
       async fn uart_parser(mut cx: uart_parser::Context, mut cmd_buf: [u8; 16], length: u16) {
-            // Simple parsing
-            cmd_buf.make_ascii_uppercase();
-
-            if cmd_buf.starts_with(b"SET_PWM(") {
-                  if cx.shared.tim1_ch1_enabled.lock(|enabled| *enabled) {
-                        // Find argument bounds
-                        // Unwrap() because '(' is definetely here
-                        let start = (cmd_buf.iter().position(|br| *br == b'(')).unwrap();
-                        match cmd_buf.iter().position(|br| *br == b')') {
-                              // Right bound was found
-                              Some(finish) => {
-                                    // Argument is a buffer slice with brackets' indexes 
-                                    let argument = &cmd_buf[start+1..finish];
-                                    // Argument validation
-                                    match argument.len() {
-                                          0 => {
-                                                cx.shared.uart1.lock(|uart1| { let _ = uart1.write_str(CommandError::EmptyArgument.message()); });
-                                          }
-                                          1 =>  {
-                                                let result: Result<(), CommandError> = if (b'0'..=b'9').contains(&argument[0]) {
-                                                      apply_pwm_duty(
-                                                            cx.shared.pwm_duty, 
-                                                            cx.shared.pwm_change_flag, 
-                                                            argument[0]-b'0',
-                                                      );
-                                                      Ok(())
-                                                } else {
-                                                      Err(CommandError::InvalidArgument)
-                                                };
-                                                if let Err(e) = result {
-                                                      cx.shared.uart1.lock(|uart1| {let _ = uart1.write_str(e.message());})
-                                                }
-                                          }
-                                          2 =>  {
-                                                let result: Result<(), CommandError> = 
-                                                      if (b'0'..=b'9').contains(&argument[0]) && (b'0'..=b'9').contains(&argument[1]) {
-                                                            apply_pwm_duty(
-                                                                  cx.shared.pwm_duty, 
-                                                                  cx.shared.pwm_change_flag, 
-                                                                  (argument[0]-b'0') * 10 + argument[1]-b'0',
-                                                            );
-                                                            Ok(())
-                                                      } else {
-                                                            Err(CommandError::InvalidArgument)
-                                                      };
-                                                if let Err(e) = result {
-                                                      cx.shared.uart1.lock(|uart1| {let _ = uart1.write_str(e.message());})
-                                                }
-                                          }
-                                          3 => {
-                                                let result: Result<(), CommandError> = if argument == [b'1', b'0', b'0'] {
-                                                      apply_pwm_duty(
-                                                            cx.shared.pwm_duty, 
-                                                            cx.shared.pwm_change_flag, 
-                                                            100,
-                                                      );
-                                                      Ok(())
-                                                } else {
-                                                      Err(CommandError::InvalidArgument)
-                                                };
-                                                if let Err(e) = result {
-                                                      cx.shared.uart1.lock(|uart1| {let _ = uart1.write_str(e.message());})
-                                                }
-                                          }
-                                          _ =>  {
-                                                cx.shared.uart1.lock(|uart1| { let _ = uart1.write_str(CommandError::ArgumentTooLong.message()); });
-                                          }
-
-                                    }
-                              }
-                              // Bound was not found
-                              None => {
-                                    cx.shared.uart1.lock(|uart1| { let _ = uart1.write_str(CommandError::UnknownCommand.message()); });
-                              }
-
+            match parse_command(&mut cmd_buf, length) {
+                  ParsedCommand::SetPwm(duty) => {
+                        if cx.shared.tim1_ch1_enabled.lock(|enabled| *enabled) {
+                              apply_pwm_duty(
+                                    cx.shared.pwm_duty, 
+                                    cx.shared.pwm_change_flag, 
+                                    duty,
+                              );  
+                              cx.shared.uart1.lock(|uart1| { let _ = uart1.write_str("PWM setted\r\n"); });
+                        }
+                        else {
+                              cx.shared.uart1.lock(|uart1| { let _ = uart1.write_str(CommandError::PwmStopped.message()); });
                         }
                   }
-                  else {
-                        cx.shared.uart1.lock(|uart1| { let _ = uart1.write_str(CommandError::PwmStopped.message()); });
+                  ParsedCommand::Stop => {
+                        unsafe { (*stm32f3xx_hal::pac::EXTI::ptr()).swier1.write(|w| w.swier0().set_bit()); }
+                        cx.shared.uart1.lock(|uart1| { let _ = uart1.write_str("PWM stopped\r\n"); });
                   }
-
-            }
-            else if cmd_buf.starts_with(b"STOP") {
-                  // Unsafe to set EXTI0 interrupt -> stop_button task fires
-                  unsafe { (*stm32f3xx_hal::pac::EXTI::ptr()).swier1.write(|w| w.swier0().set_bit()); }
-                  cx.shared.uart1.lock(|uart1| { let _ = uart1.write_str("PWM stopped\r\n"); });
-            }
-            else if cmd_buf.starts_with(b"RESUME") {
-                  (cx.shared.tim1_ch1, cx.shared.tim1_ch1_enabled).lock(|tim1_ch1, enabled| {
-                        tim1_ch1.enable();
-                        *enabled = true;
-                  });
-                  cx.shared.uart1.lock(|uart1| { let _ = uart1.write_str("PWM resumed\r\n"); });
-
-            }
-            else if cmd_buf.starts_with(b"DROP_ARG") {
-                  apply_pwm_duty(
-                        cx.shared.pwm_duty, 
-                        cx.shared.pwm_change_flag, 
-                        0,
-                  );
-                  cx.shared.uart1.lock(|uart1| { let _ = uart1.write_str("Argument was dropped to 0\r\n"); });
-
-            }
-            else if cmd_buf.starts_with(b"STATUS") {
-                  let duty = cx.shared.pwm_duty.lock(|duty| *duty);
-                  let state = cx.shared.tim1_ch1_enabled.lock(|state| *state);
-
-                  // Store status metadata
-                  let mut status_handler: String<96> = String::new();
-                  if let Err(_) = write!(
-                        status_handler, 
-                        "# - - - - - - -\r\n| PWM works on: {}%\r\n| PWM state is: {}\r\n", 
-                        duty, 
-                        if state { "RUNNING" } else { "STOPPED" } 
-                  ) {
-                        cx.shared.uart1.lock(|uart1| {
-                              let _ = uart1.write_str("Error: status_handler buffer is too small to show this message!\r\n");
-                              return;
+                  ParsedCommand::Resume => {
+                        (cx.shared.tim1_ch1, cx.shared.tim1_ch1_enabled).lock(|tim1_ch1, enabled| {
+                              tim1_ch1.enable();
+                              *enabled = true;
                         });
+                        cx.shared.uart1.lock(|uart1| { let _ = uart1.write_str("PWM resumed\r\n"); });
                   }
-                  cx.shared.uart1.lock(|uart1| { let _ = uart1.write_str(&status_handler); });
-            }
-            else {
-                  cx.shared.uart1.lock(|uart1| { let _ = uart1.write_str(CommandError::UnknownCommand.message()); });
+                  ParsedCommand::DropArg => {
+                        apply_pwm_duty(
+                              cx.shared.pwm_duty, 
+                              cx.shared.pwm_change_flag, 
+                              0,
+                        );
+                        cx.shared.uart1.lock(|uart1| { let _ = uart1.write_str("Argument was dropped to 0\r\n"); });
+                  }
+                  ParsedCommand::Status => {
+                        let duty = cx.shared.pwm_duty.lock(|duty| *duty);
+                        let state = cx.shared.tim1_ch1_enabled.lock(|state| *state);
+
+                        // Store status metadata
+                        let mut status_handler: String<96> = String::new();
+                        if let Err(_) = write!(
+                              status_handler, 
+                              "# - - - - - - -\r\n| PWM works on: {}%\r\n| PWM state is: {}\r\n", 
+                              duty, 
+                              if state { "RUNNING" } else { "STOPPED" } 
+                        ) {
+                              cx.shared.uart1.lock(|uart1| {
+                                    let _ = uart1.write_str("Error: status_handler buffer is too small to show this message!\r\n");
+                                    return;
+                              });
+                        }
+                        cx.shared.uart1.lock(|uart1| { let _ = uart1.write_str(&status_handler); });
+                  }
+                  ParsedCommand::Error(error) => {
+                        cx.shared.uart1.lock(|uart1| { let _ = uart1.write_str(error.message()); });
+                  }
             }
       }
 }
