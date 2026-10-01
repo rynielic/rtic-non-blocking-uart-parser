@@ -6,13 +6,11 @@ use panic_probe as _;
 
 #[rtic::app(device = stm32f3xx_hal::pac, dispatchers = [SPI1])]
 mod app {
-
       use core::fmt::Write;
       use heapless::String;
       use cortex_m::{asm::wfi, singleton};
-      use defmt::println;
       use stm32f3xx_hal::{
-            pwm::tim1, 
+            pwm::tim1,
             time::rate::*, 
             dma::{
                   Channel, 
@@ -38,7 +36,9 @@ mod app {
             UnknownCommand,
             PwmStopped,
             BufferOverflow,
-            CommandBusy
+            CommandBusy,
+            CrcMismatch,
+            CrcNotFound,
       }
       impl CommandError {
             fn message (&self) -> &'static str {
@@ -49,7 +49,9 @@ mod app {
                         CommandError::UnknownCommand => "Error: Unknown command!\r\n",
                         CommandError::PwmStopped => "Error: Unable to set value - PWM is stopped. To continue enter RESUME\r\n",
                         CommandError::BufferOverflow => "Error: Command too long, buffer cleared!\r\n",
-                        CommandError::CommandBusy => "Error: Busy, command dropped\r\n"
+                        CommandError::CommandBusy => "Error: Busy, command dropped\r\n",
+                        CommandError::CrcMismatch => "Error: CRC mismatch!\r\n",
+                        CommandError::CrcNotFound => "Error: Corrupted data!\r\n",
                   }
             }
       }
@@ -63,12 +65,15 @@ mod app {
             Error(CommandError),
       }
 
-      fn parse_command (cmd_buf: &mut [u8; 16], length: u16) -> ParsedCommand {
-            cmd_buf.make_ascii_uppercase();
+      fn parse_command (cmd_buf: &mut [u8; 32], length: u16) -> ParsedCommand {
+            let cmd = match crc_match(cmd_buf, length) {
+                  Ok(cmd) => cmd,
+                  Err(err) => {
+                        return ParsedCommand::Error(err);
+                  }
+            };
 
-            // Slice by amount of incomed bytes to strip excess bytes like '0' and '13'(b'\r')
-            let cmd: &[u8] = &cmd_buf[..length as usize - 1];
-      
+            
             if let Some(rest) = cmd.strip_prefix(b"SET_PWM(") {
                   return match rest.iter().position(|br| *br == b')') {
                         Some(finish) if finish == rest.len() - 1 => parse_pwm_argument(&rest[..finish]),
@@ -102,6 +107,45 @@ mod app {
             pwm_duty.lock(|duty| *duty = value);   
             pwm_change_flag.lock(|flag| *flag = true);
       }
+
+      fn crc16 (cmd: &[u8]) -> u16 {
+            let polynomial = 0x1021;
+            let mut crc = 0xFFFF;
+            for &byte in cmd {
+                  crc ^= (byte as u16) << 8;
+                  for _ in 0..8 {
+                        if crc & 0x8000 != 0 {
+                        crc = (crc << 1) ^ polynomial;
+                        }
+                        else {
+                        crc <<= 1;
+                        }
+                  }
+            }
+            crc
+      }
+      
+      fn crc_match (cmd_buf: &mut [u8; 32], length: u16) -> Result<&[u8], CommandError> {
+            let slice_index = match cmd_buf.iter().position(|ch| *ch == b'*') {
+                  Some(ind) => ind,
+                  _ => return Err(CommandError::CrcNotFound),
+            };
+
+            let cmd_slice= &cmd_buf[..slice_index];
+            let crc_slice = &cmd_buf[slice_index+1..length as usize -1];
+
+            let expected = core::str::from_utf8(crc_slice)
+                  .ok()
+                  .and_then(|s| u16::from_str_radix(s, 16).ok());
+            if expected == Some(crc16(cmd_slice)) {
+                  Ok(cmd_slice)
+            }
+            else {
+                  Err(CommandError::CrcMismatch)
+            }
+            
+      }
+
       #[shared]
       struct Shared {
             uart1: Serial<USART1, (Uart1TxPin, Uart1RxPin)>,
@@ -117,7 +161,7 @@ mod app {
             rx_buffer_length: u16,
             last_cndtr: u16,
             cmd_index: usize,
-            cmd_buf: [u8;16],
+            cmd_buf: [u8; 32],
       }
 
       #[init]
@@ -208,7 +252,7 @@ mod app {
 
             (
                   Shared {uart1, pwm_duty: 0, pwm_change_flag: false, tim1_ch1, tim1_ch1_enabled: true}, 
-                  Local {rx_buffer_addr, rx_buffer_length, last_cndtr, cmd_index: 0, cmd_buf: [0u8; 16]}
+                  Local {rx_buffer_addr, rx_buffer_length, last_cndtr, cmd_index: 0, cmd_buf: [0u8; 32]}
             )
       }
       
@@ -260,16 +304,15 @@ mod app {
                         let rx_buffer_ptr = (rx_buffer_addr as *const u8).add(rx_index as usize);
                         core::ptr::read_volatile(rx_buffer_ptr)
                   };
-                  cx.shared.uart1.lock(|uart1| { let _ = uart1.write_char(byte as char); });
                   
                   // Wtire byte to the extra buffer index
                   cmd_buf[*cmd_index] = byte;
                   *cmd_index += 1;
 
                   // Prevent overflow 
-                  if *cmd_index == 16 {
+                  if *cmd_index == 32 {
                         *cmd_index = 0;
-                        *cmd_buf = [0u8; 16];
+                        *cmd_buf = [0u8; 32];
                         cx.shared.uart1.lock(|uart1| { let _ = uart1.write_str(CommandError::BufferOverflow.message()); });
                   }
 
@@ -282,7 +325,7 @@ mod app {
                               });
                         }
                         *cmd_index = 0;
-                        *cmd_buf = [0u8; 16];
+                        *cmd_buf = [0u8; 32];
                         cx.shared.uart1.lock(|uart1| { let _ = uart1.write_char('\n'); });
                   }
 
@@ -303,7 +346,7 @@ mod app {
       }
 
       #[task(priority = 1, shared = [uart1, pwm_duty, pwm_change_flag, tim1_ch1, tim1_ch1_enabled])]
-      async fn uart_parser(mut cx: uart_parser::Context, mut cmd_buf: [u8; 16], length: u16) {
+      async fn uart_parser(mut cx: uart_parser::Context, mut cmd_buf: [u8; 32], length: u16) {
             match parse_command(&mut cmd_buf, length) {
                   ParsedCommand::SetPwm(duty) => {
                         if cx.shared.tim1_ch1_enabled.lock(|enabled| *enabled) {

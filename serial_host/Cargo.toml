@@ -1,0 +1,8 @@
+[package]
+name = "serial_host"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serialport = "4.10"
+
