@@ -27,7 +27,6 @@ mod app {
       type Uart1TxPin = stm32f3xx_hal::gpio::Pin<stm32f3xx_hal::gpio::Gpioc, stm32f3xx_hal::gpio::U<4>, stm32f3xx_hal::gpio::Alternate<stm32f3xx_hal::gpio::PushPull, 7>>;
       type Uart1RxPin = stm32f3xx_hal::gpio::Pin<stm32f3xx_hal::gpio::Gpioc, stm32f3xx_hal::gpio::U<5>, stm32f3xx_hal::gpio::Alternate<stm32f3xx_hal::gpio::PushPull, 7>>;
       type Tim3Channel1 = stm32f3xx_hal::pwm::PwmChannel<stm32f3xx_hal::pwm::Tim1Ch1, stm32f3xx_hal::pwm::WithPins>;
-      //type StopButtonPin = stm32f3xx_hal::gpio::Pin<stm32f3xx_hal::gpio::Gpioa, stm32f3xx_hal::gpio::U<0>, stm32f3xx_hal::gpio::Input>;
 
       enum CommandError {
             EmptyArgument,
@@ -126,10 +125,12 @@ mod app {
       }
       
       fn crc_match (cmd_buf: &mut [u8; 32], length: u16) -> Result<&[u8], CommandError> {
+            // search for '*'
             let slice_index = match cmd_buf.iter().position(|ch| *ch == b'*') {
                   Some(ind) => ind,
                   _ => return Err(CommandError::CrcNotFound),
             };
+
 
             let cmd_slice= &cmd_buf[..slice_index];
             let crc_slice = &cmd_buf[slice_index+1..length as usize -1];
@@ -137,6 +138,7 @@ mod app {
             let expected = core::str::from_utf8(crc_slice)
                   .ok()
                   .and_then(|s| u16::from_str_radix(s, 16).ok());
+
             if expected == Some(crc16(cmd_slice)) {
                   Ok(cmd_slice)
             }
