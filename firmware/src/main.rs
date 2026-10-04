@@ -16,12 +16,11 @@ mod app {
                   Direction::FromPeripheral, 
                   Increment::{Disable, Enable}, 
                   Target
-            }, gpio::Edge, pac::USART1, prelude::*, pwm::tim1, serial::{Event, Serial},
+            }, gpio::Edge, pac::{CRC, DMA1, EXTI, RCC, TIM3, USART1}, prelude::*, serial::{Event, Serial},
       };
 
       type Uart1TxPin = stm32f3xx_hal::gpio::Pin<stm32f3xx_hal::gpio::Gpioc, stm32f3xx_hal::gpio::U<4>, stm32f3xx_hal::gpio::Alternate<stm32f3xx_hal::gpio::PushPull, 7>>;
       type Uart1RxPin = stm32f3xx_hal::gpio::Pin<stm32f3xx_hal::gpio::Gpioc, stm32f3xx_hal::gpio::U<5>, stm32f3xx_hal::gpio::Alternate<stm32f3xx_hal::gpio::PushPull, 7>>;
-      type Tim3Channel1 = stm32f3xx_hal::pwm::PwmChannel<stm32f3xx_hal::pwm::Tim1Ch1, stm32f3xx_hal::pwm::WithPins>;
 
       enum CommandError {
             EmptyArgument,
@@ -92,15 +91,6 @@ mod app {
                   _ => ParsedCommand::Error(CommandError::ArgumentTooLong), 
             }
       }
-
-      fn apply_pwm_duty (
-            mut pwm_duty: impl rtic::Mutex<T = u8>,
-            mut pwm_change_flag: impl rtic::Mutex<T = bool>,
-            value: u8,
-      ) {
-            pwm_duty.lock(|duty| *duty = value);   
-            pwm_change_flag.lock(|flag| *flag = true);
-      }
       
       fn crc_match (cmd_body: &[u8]) -> Result<&[u8], CommandError> {
             // search for '*'
@@ -120,30 +110,73 @@ mod app {
 
             unsafe {
                   // Reset CRC
-                  (*stm32f3xx_hal::pac::CRC::ptr()).cr.modify(|_, w| w.reset().set_bit());
+                  (*CRC::ptr()).cr.modify(|_, w| w.reset().set_bit());
                   // Iterate over each byte from the command
                   for &byte in cmd_slice {
                         // Write the byte into CRC data register
-                        (*stm32f3xx_hal::pac::CRC::ptr()).dr8().write(|w| w.dr8().bits(byte));
+                        (*CRC::ptr()).dr8().write(|w| w.dr8().bits(byte));
                   }
                   // Read the checksum from CRC data register
-                  let calculated_checksum = ((*stm32f3xx_hal::pac::CRC::ptr()).dr().read().bits() & 0xFFFF) as u16;
+                  let calculated_checksum = ((*CRC::ptr()).dr().read().bits() & 0xFFFF) as u16;
 
                   if expected_checksum != Some(calculated_checksum) {
                         return Err(CommandError::CrcMismatch)
                   }
                   Ok(cmd_slice)
             }
-            
       }
 
+      fn apply_pwm_duty (
+            mut pwm_duty: impl rtic::Mutex<T = u8>,
+            mut pwm_change_flag: impl rtic::Mutex<T = bool>,
+            value: u8,
+      ) {
+            pwm_duty.lock(|duty| *duty = value);   
+            pwm_change_flag.lock(|flag| *flag = true);
+      }
+
+      fn timer_state(state: bool) {
+            unsafe {
+                  if state {
+                        // Restore PWM Mode 1
+                        (*TIM3::ptr()).ccmr1_output().modify(|_, w| w.oc1m().pwm_mode1());  
+                        // Restart the counter
+                        (*TIM3::ptr()).cr1.modify(|_, w| w.cen().enabled());
+                        return;
+                  }
+                  // Stop the counter (saves power)
+                  (*TIM3::ptr()).cr1.modify(|_, w| w.cen().disabled());
+                  // Actively force the output pin LOW (0V)
+                  (*TIM3::ptr()).ccmr1_output().modify(|_, w| w.oc1m().force_inactive());
+                  // Reset counter to 0 so next start begins at the phase start
+                  (*TIM3::ptr()).cnt.write(|w| w.bits(0));
+            }
+      }
+
+      fn set_duty(duty: u8) {
+            unsafe {
+                  if duty == 0 {
+                        // Change duty
+                        (*TIM3::ptr()).ccr1().write(|w| w.ccr().bits(duty as u16));
+                        // Stop the counter (saves power)
+                        timer_state(false);
+                        return;
+                  }
+                  // Change duty
+                  (*TIM3::ptr()).ccr1().write(|w| w.ccr().bits(duty as u16));
+                  // Force immediate transfer from preload to active shadow register
+                  (*TIM3::ptr()).egr.write(|w| w.ug().set_bit());
+
+                  timer_state(true);
+            }
+      }
+      
       #[shared]
       struct Shared {
             uart1: Serial<USART1, (Uart1TxPin, Uart1RxPin)>,
             pwm_duty: u8,
             pwm_change_flag: bool,
-            tim1_ch1: Tim3Channel1,
-            tim1_ch1_enabled: bool,
+            tim3_ch1_enabled: bool,
       }
 
       #[local]
@@ -173,12 +206,11 @@ mod app {
             // GPIO
             let mut gpioa = dp.GPIOA.split(&mut rcc.ahb);
             let mut gpioc = dp.GPIOC.split(&mut rcc.ahb);
-            let mut gpioe = dp.GPIOE.split(&mut rcc.ahb);
 
-            // Pins
-            let red_led = gpioe
-                  .pe9
-                  .into_af_push_pull::<2>(&mut gpioe.moder, &mut gpioe.otyper, &mut gpioe.afrh);
+            // PC6
+            let _ = gpioc
+                  .pc6
+                  .into_af_push_pull::<2>(&mut gpioc.moder, &mut gpioc.otyper, &mut gpioc.afrl);
             let mut stop_button = gpioa
                   .pa0
                   .into_pull_down_input(&mut gpioa.moder, &mut gpioa.pupdr);
@@ -188,11 +220,6 @@ mod app {
             let uart1_rx = gpioc
                   .pc5
                   .into_af_push_pull::<7>(&mut gpioc.moder, &mut gpioc.otyper, &mut gpioc.afrl);
-
-            // TIM1 channel 1
-            let (tim1_ch1_no_pins, ..) = tim1(dp.TIM1, 100, 500.Hz(), &clock);
-            let mut tim1_ch1 = tim1_ch1_no_pins.output_to_pe9(red_led);
-            tim1_ch1.enable();
 
             // UART1
             let mut uart1 = Serial::new(
@@ -212,6 +239,7 @@ mod app {
             syscfg.select_exti_interrupt_source(&stop_button);
             stop_button.trigger_on_edge(&mut exti, Edge::Rising);
             stop_button.enable_interrupt(&mut exti);
+
             // DMA 1 channel 5
             let dma1 = dp.DMA1.split(&mut rcc.ahb);
             let mut uart1_rx_channel= dma1.ch5;
@@ -232,35 +260,65 @@ mod app {
                   uart1_rx_channel.set_direction(FromPeripheral);
 
                   // Circ bit enable
-                  (*stm32f3xx_hal::pac::DMA1::ptr()).ch5.cr.modify(|_, w| w.circ().set_bit());
+                  (*DMA1::ptr()).ch5.cr.modify(|_, w| w.circ().set_bit());
                   // Read the DMA1_CNDTR register
-                  last_cndtr = (*stm32f3xx_hal::pac::DMA1::ptr()).ch5.ndtr.read().ndt().bits();
+                  last_cndtr = (*DMA1::ptr()).ch5.ndtr.read().ndt().bits();
                   // Prevent compiler reordering  
                   core::sync::atomic::compiler_fence(Release);
 
                   uart1_rx_channel.enable();
             }
+
+            // TIM3 channel 1
+            unsafe {
+                  // TIM3 clock enable
+                  (*RCC::ptr()).apb1enr.modify(|_, w| w.tim3en().set_bit());
+                  // Force the enable to settle before touching CRC's registers
+                  let _ = (*RCC::ptr()).apb1enr.read().tim3en().bit();
+                  // Set const values
+                  (*TIM3::ptr()).psc.write(|w| w.psc().bits(1439)); // set prescaler to 1440
+                  (*TIM3::ptr()).arr.write(|w| w.arr().bits(99)); // set resolution to 100 steps
+                  // Enable compare preload mode
+                  (*TIM3::ptr()).ccer.modify(|_, w| w.cc1e().set_bit());
+                  (*TIM3::ptr()).ccmr1_output().modify(|_, w| {
+                        w.oc1m().pwm_mode1();
+                        w.oc1pe().enabled()
+                  });
+                  // Set duty cycle
+                  (*TIM3::ptr()).ccr1().write(|w| w.ccr().bits(0));
+                  // Configure and enable
+                  (*TIM3::ptr()).cr1.write(|w| { 
+                        w.arpe().enabled();
+                        w.cms().edge_aligned();
+                        w.dir().up();
+                        w.cen().enabled()
+                  });
+            }
             
             // CRC configuration
             unsafe {
                   // CRC clock enable
-                  (*stm32f3xx_hal::pac::RCC::ptr()).ahbenr.modify(|_, w| w.crcen().set_bit());
-                  // Rorce the enable to settle before touching CRC's registers
+                  (*RCC::ptr()).ahbenr.modify(|_, w| w.crcen().set_bit());
+                  // Force the enable to settle before touching CRC's registers
                   let _ = (*stm32f3xx_hal::pac::RCC::ptr()).ahbenr.read(); 
-
-                  // Configure CRC's registers
-                  (*stm32f3xx_hal::pac::CRC::ptr()).cr.modify(|_, w| w.polysize().polysize16());
-                  (*stm32f3xx_hal::pac::CRC::ptr()).init.write(|w| w.init().bits(0xFFFF));
-                  (*stm32f3xx_hal::pac::CRC::ptr()).pol.write(|w| w.pol().bits(0x1021));
+                  // Set the inital CRC's value and polynomial
+                  (*CRC::ptr()).init.write(|w| w.init().bits(0xFFFF));
+                  (*CRC::ptr()).pol.write(|w| w.pol().bits(0x1021));
+                  // CCITT-FALSE
+                  (*CRC::ptr()).cr.modify(|_, w| {
+                        w.polysize().polysize16();
+                        w.rev_in().normal();
+                        w.rev_out().normal()
+                  });
             }
 
             (
-                  Shared {uart1, pwm_duty: 0, pwm_change_flag: false, tim1_ch1, tim1_ch1_enabled: true}, 
+                  Shared {uart1, pwm_duty: 0, pwm_change_flag: false, tim3_ch1_enabled: true}, 
                   Local {rx_buffer_addr, rx_buffer_length, last_cndtr, cmd_index: 0, cmd: [0u8; 32]}
             )
       }
       
-      #[idle(shared = [pwm_duty, pwm_change_flag, tim1_ch1])]
+      #[idle(shared = [pwm_duty, pwm_change_flag])]
       fn idle (mut cx: idle::Context) -> ! {
             loop {
                   // Check if the pwm_duty value was changed since the last read 
@@ -270,11 +328,10 @@ mod app {
                         was_set
                   });
                   if changed {
-                        cx.shared.tim1_ch1.lock(|tim1_ch1| {
-                              cx.shared.pwm_duty.lock(|pwm_duty| {
-                                    tim1_ch1.set_duty(*pwm_duty as u16);
-                              })
-                        });
+                        cx.shared.pwm_duty.lock(|pwm_duty| {
+                              println!("applying duty: {}", *pwm_duty);
+                              set_duty(*pwm_duty);
+                        })
                   }
                   // Sleep mode
                   wfi();
@@ -285,7 +342,7 @@ mod app {
       fn uart_rx (mut cx: uart_rx::Context) {
 
             // Clear USART1_IDLE interrupt 
-            unsafe { (*stm32f3xx_hal::pac::USART1::ptr()).icr.write(|w| w.idlecf().set_bit()) };
+            unsafe { (*USART1::ptr()).icr.write(|w| w.idlecf().set_bit()) };
 
             // Declare the locals
             let last_cndtr = cx.local.last_cndtr;
@@ -295,7 +352,7 @@ mod app {
             let cmd = cx.local.cmd;
 
             // Unsafe to access the DMA1_CNDRT register 
-            let current_cndtr = unsafe { (*stm32f3xx_hal::pac::DMA1::ptr()).ch5.ndtr.read().ndt().bits() };
+            let current_cndtr = unsafe { (*DMA1::ptr()).ch5.ndtr.read().ndt().bits() };
             // Compute how many bytes income
             let delta = (*last_cndtr + rx_buffer_length - current_cndtr) % rx_buffer_length;
             for i in 0..delta {
@@ -336,42 +393,42 @@ mod app {
             *last_cndtr = current_cndtr;
       }
 
-      #[task(binds = EXTI0, priority = 3, shared = [tim1_ch1, tim1_ch1_enabled])]
-      fn stop_button (cx: stop_button::Context) {
+      #[task(binds = EXTI0, priority = 3, shared = [tim3_ch1_enabled])]
+      fn stop_button (mut cx: stop_button::Context) {
             // stop PWM
-            (cx.shared.tim1_ch1, cx.shared.tim1_ch1_enabled).lock(|tim1_ch1, enabled| {
-                  tim1_ch1.disable();
+            (cx.shared.tim3_ch1_enabled).lock(|enabled| {
+                  timer_state(false);
                   *enabled = false;
             });
 
             // unsafe to clear EXTI0 interrupt
-            unsafe { (*stm32f3xx_hal::pac::EXTI::ptr()).pr1.write(|w| w.pr0().set_bit()); }
+            unsafe { (*EXTI::ptr()).pr1.write(|w| w.pr0().set_bit()); }
       }
 
-      #[task(priority = 1, shared = [uart1, pwm_duty, pwm_change_flag, tim1_ch1, tim1_ch1_enabled])]
+      #[task(priority = 1, shared = [uart1, pwm_duty, pwm_change_flag, tim3_ch1_enabled])]
       async fn uart_parser(mut cx: uart_parser::Context, cmd_buf: [u8; 32], length: usize) {
             let cmd_body = &cmd_buf[..length];
             match parse_command(cmd_body) {
                   ParsedCommand::SetPwm(duty) => {
-                        if cx.shared.tim1_ch1_enabled.lock(|enabled| *enabled) {
+                        if cx.shared.tim3_ch1_enabled.lock(|enabled| *enabled) {
                               apply_pwm_duty(
                                     cx.shared.pwm_duty, 
                                     cx.shared.pwm_change_flag, 
                                     duty,
                               );  
-                              cx.shared.uart1.lock(|uart1| { let _ = uart1.write_str("PWM setted\r\n"); });
+                              cx.shared.uart1.lock(|uart1| { let _ = uart1.write_str("PWM set\r\n"); });
                         }
                         else {
                               cx.shared.uart1.lock(|uart1| { let _ = uart1.write_str(CommandError::PwmStopped.message()); });
                         }
                   }
                   ParsedCommand::Stop => {
-                        unsafe { (*stm32f3xx_hal::pac::EXTI::ptr()).swier1.write(|w| w.swier0().set_bit()); }
+                        unsafe { (*EXTI::ptr()).swier1.write(|w| w.swier0().set_bit()); }
                         cx.shared.uart1.lock(|uart1| { let _ = uart1.write_str("PWM stopped\r\n"); });
                   }
                   ParsedCommand::Resume => {
-                        (cx.shared.tim1_ch1, cx.shared.tim1_ch1_enabled).lock(|tim1_ch1, enabled| {
-                              tim1_ch1.enable();
+                        (cx.shared.tim3_ch1_enabled).lock(|enabled| {
+                              timer_state(true);
                               *enabled = true;
                         });
                         cx.shared.uart1.lock(|uart1| { let _ = uart1.write_str("PWM resumed\r\n"); });
@@ -386,7 +443,7 @@ mod app {
                   }
                   ParsedCommand::Status => {
                         let duty = cx.shared.pwm_duty.lock(|duty| *duty);
-                        let state = cx.shared.tim1_ch1_enabled.lock(|state| *state);
+                        let state = cx.shared.tim3_ch1_enabled.lock(|state| *state);
 
                         // Store status metadata
                         let mut status_handler: String<96> = String::new();
@@ -398,8 +455,8 @@ mod app {
                         ) {
                               cx.shared.uart1.lock(|uart1| {
                                     let _ = uart1.write_str("Error: status_handler buffer is too small to show this message!\r\n");
-                                    return;
                               });
+                              return;
                         }
                         cx.shared.uart1.lock(|uart1| { let _ = uart1.write_str(&status_handler); });
                   }
