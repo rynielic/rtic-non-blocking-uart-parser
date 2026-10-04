@@ -6,22 +6,17 @@ use panic_probe as _;
 
 #[rtic::app(device = stm32f3xx_hal::pac, dispatchers = [SPI1])]
 mod app {
-      use core::fmt::Write;
+      use core::{fmt::Write, sync::atomic::Ordering::Release};
+      use defmt::println;
       use heapless::String;
       use cortex_m::{asm::wfi, singleton};
       use stm32f3xx_hal::{
-            pwm::tim1,
-            time::rate::*, 
             dma::{
                   Channel, 
                   Direction::FromPeripheral, 
                   Increment::{Disable, Enable}, 
                   Target
-            }, 
-            gpio::Edge, 
-            pac::USART1, 
-            prelude::*, 
-            serial::{Event, Serial},
+            }, gpio::Edge, pac::USART1, prelude::*, pwm::tim1, serial::{Event, Serial},
       };
 
       type Uart1TxPin = stm32f3xx_hal::gpio::Pin<stm32f3xx_hal::gpio::Gpioc, stm32f3xx_hal::gpio::U<4>, stm32f3xx_hal::gpio::Alternate<stm32f3xx_hal::gpio::PushPull, 7>>;
@@ -64,15 +59,14 @@ mod app {
             Error(CommandError),
       }
 
-      fn parse_command (cmd_buf: &mut [u8; 32], length: u16) -> ParsedCommand {
-            let cmd = match crc_match(cmd_buf, length) {
+      fn parse_command (cmd_body: &[u8]) -> ParsedCommand {
+            let cmd = match crc_match(cmd_body) {
                   Ok(cmd) => cmd,
                   Err(err) => {
                         return ParsedCommand::Error(err);
                   }
             };
 
-            
             if let Some(rest) = cmd.strip_prefix(b"SET_PWM(") {
                   return match rest.iter().position(|br| *br == b')') {
                         Some(finish) if finish == rest.len() - 1 => parse_pwm_argument(&rest[..finish]),
@@ -87,6 +81,7 @@ mod app {
                   _ => ParsedCommand::Error(CommandError::UnknownCommand),        
             }
       }
+
       fn parse_pwm_argument(argument: &[u8]) -> ParsedCommand {
             match argument {
                   [] => ParsedCommand::Error(CommandError::EmptyArgument),
@@ -106,44 +101,38 @@ mod app {
             pwm_duty.lock(|duty| *duty = value);   
             pwm_change_flag.lock(|flag| *flag = true);
       }
-
-      fn crc16 (cmd: &[u8]) -> u16 {
-            let polynomial = 0x1021;
-            let mut crc = 0xFFFF;
-            for &byte in cmd {
-                  crc ^= (byte as u16) << 8;
-                  for _ in 0..8 {
-                        if crc & 0x8000 != 0 {
-                        crc = (crc << 1) ^ polynomial;
-                        }
-                        else {
-                        crc <<= 1;
-                        }
-                  }
-            }
-            crc
-      }
       
-      fn crc_match (cmd_buf: &mut [u8; 32], length: u16) -> Result<&[u8], CommandError> {
+      fn crc_match (cmd_body: &[u8]) -> Result<&[u8], CommandError> {
             // search for '*'
-            let slice_index = match cmd_buf.iter().position(|ch| *ch == b'*') {
+            let slice_index = match cmd_body.iter().rposition(|ch| *ch == b'*') {
                   Some(ind) => ind,
                   _ => return Err(CommandError::CrcNotFound),
             };
 
-
-            let cmd_slice= &cmd_buf[..slice_index];
-            let crc_slice = &cmd_buf[slice_index+1..length as usize -1];
-
-            let expected = core::str::from_utf8(crc_slice)
+            // Contains the command itself
+            let cmd_slice= &cmd_body[..slice_index];
+            // Contains raw bytes of the checksum
+            let crc_slice = &cmd_body[slice_index + 1..cmd_body.len() - 1];
+            // Formated checsum
+            let expected_checksum = core::str::from_utf8(crc_slice)
                   .ok()
                   .and_then(|s| u16::from_str_radix(s, 16).ok());
 
-            if expected == Some(crc16(cmd_slice)) {
+            unsafe {
+                  // Reset CRC
+                  (*stm32f3xx_hal::pac::CRC::ptr()).cr.modify(|_, w| w.reset().set_bit());
+                  // Iterate over each byte from the command
+                  for &byte in cmd_slice {
+                        // Write the byte into CRC data register
+                        (*stm32f3xx_hal::pac::CRC::ptr()).dr8().write(|w| w.dr8().bits(byte));
+                  }
+                  // Read the checksum from CRC data register
+                  let calculated_checksum = ((*stm32f3xx_hal::pac::CRC::ptr()).dr().read().bits() & 0xFFFF) as u16;
+
+                  if expected_checksum != Some(calculated_checksum) {
+                        return Err(CommandError::CrcMismatch)
+                  }
                   Ok(cmd_slice)
-            }
-            else {
-                  Err(CommandError::CrcMismatch)
             }
             
       }
@@ -163,7 +152,7 @@ mod app {
             rx_buffer_length: u16,
             last_cndtr: u16,
             cmd_index: usize,
-            cmd_buf: [u8; 32],
+            cmd: [u8; 32],
       }
 
       #[init]
@@ -233,7 +222,7 @@ mod app {
             let rx_buffer_length = rx_buffer.len() as u16;
             let rx_buffer_addr = rx_buffer.as_mut_ptr() as u32;
             let last_cndtr: u16;
- 
+            
             // DMA configuration
             unsafe {
                   uart1_rx_channel.set_peripheral_address(usart1_rdr, Disable);
@@ -247,14 +236,27 @@ mod app {
                   // Read the DMA1_CNDTR register
                   last_cndtr = (*stm32f3xx_hal::pac::DMA1::ptr()).ch5.ndtr.read().ndt().bits();
                   // Prevent compiler reordering  
-                  core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
+                  core::sync::atomic::compiler_fence(Release);
 
                   uart1_rx_channel.enable();
+            }
+            
+            // CRC configuration
+            unsafe {
+                  // CRC clock enable
+                  (*stm32f3xx_hal::pac::RCC::ptr()).ahbenr.modify(|_, w| w.crcen().set_bit());
+                  // Rorce the enable to settle before touching CRC's registers
+                  let _ = (*stm32f3xx_hal::pac::RCC::ptr()).ahbenr.read(); 
+
+                  // Configure CRC's registers
+                  (*stm32f3xx_hal::pac::CRC::ptr()).cr.modify(|_, w| w.polysize().polysize16());
+                  (*stm32f3xx_hal::pac::CRC::ptr()).init.write(|w| w.init().bits(0xFFFF));
+                  (*stm32f3xx_hal::pac::CRC::ptr()).pol.write(|w| w.pol().bits(0x1021));
             }
 
             (
                   Shared {uart1, pwm_duty: 0, pwm_change_flag: false, tim1_ch1, tim1_ch1_enabled: true}, 
-                  Local {rx_buffer_addr, rx_buffer_length, last_cndtr, cmd_index: 0, cmd_buf: [0u8; 32]}
+                  Local {rx_buffer_addr, rx_buffer_length, last_cndtr, cmd_index: 0, cmd: [0u8; 32]}
             )
       }
       
@@ -279,7 +281,7 @@ mod app {
             }
       }
 
-      #[task(binds = USART1_EXTI25, priority = 2, shared = [uart1], local = [last_cndtr, rx_buffer_length, rx_buffer_addr, cmd_index, cmd_buf])]
+      #[task(binds = USART1_EXTI25, priority = 2, shared = [uart1], local = [last_cndtr, rx_buffer_length, rx_buffer_addr, cmd_index, cmd])]
       fn uart_rx (mut cx: uart_rx::Context) {
 
             // Clear USART1_IDLE interrupt 
@@ -290,12 +292,11 @@ mod app {
             let rx_buffer_length = *cx.local.rx_buffer_length;
             let rx_buffer_addr = *cx.local.rx_buffer_addr;
             let cmd_index = cx.local.cmd_index;
-            let cmd_buf = cx.local.cmd_buf;
+            let cmd = cx.local.cmd;
 
             // Unsafe to access the DMA1_CNDRT register 
             let current_cndtr = unsafe { (*stm32f3xx_hal::pac::DMA1::ptr()).ch5.ndtr.read().ndt().bits() };
             // Compute how many bytes income
-            // Helpful for commands pasting 
             let delta = (*last_cndtr + rx_buffer_length - current_cndtr) % rx_buffer_length;
             for i in 0..delta {
                   // Calculate the physical index in the buffer
@@ -308,26 +309,26 @@ mod app {
                   };
                   
                   // Wtire byte to the extra buffer index
-                  cmd_buf[*cmd_index] = byte;
+                  cmd[*cmd_index] = byte;
                   *cmd_index += 1;
 
                   // Prevent overflow 
                   if *cmd_index == 32 {
                         *cmd_index = 0;
-                        *cmd_buf = [0u8; 32];
+                        *cmd = [0u8; 32];
                         cx.shared.uart1.lock(|uart1| { let _ = uart1.write_str(CommandError::BufferOverflow.message()); });
                   }
 
                   // Start parsing and clear extra buffer by sending \n
                   else if byte == 13 {
                         // Spawn error handler
-                        if let Err(_) = uart_parser::spawn(*cmd_buf, *cmd_index as u16) {
+                        if let Err(_) = uart_parser::spawn(*cmd, *cmd_index) {
                               cx.shared.uart1.lock(|uart1| {
                                     let _ = uart1.write_str(CommandError::CommandBusy.message());
                               });
                         }
                         *cmd_index = 0;
-                        *cmd_buf = [0u8; 32];
+                        *cmd = [0u8; 32];
                         cx.shared.uart1.lock(|uart1| { let _ = uart1.write_char('\n'); });
                   }
 
@@ -348,8 +349,9 @@ mod app {
       }
 
       #[task(priority = 1, shared = [uart1, pwm_duty, pwm_change_flag, tim1_ch1, tim1_ch1_enabled])]
-      async fn uart_parser(mut cx: uart_parser::Context, mut cmd_buf: [u8; 32], length: u16) {
-            match parse_command(&mut cmd_buf, length) {
+      async fn uart_parser(mut cx: uart_parser::Context, cmd_buf: [u8; 32], length: usize) {
+            let cmd_body = &cmd_buf[..length];
+            match parse_command(cmd_body) {
                   ParsedCommand::SetPwm(duty) => {
                         if cx.shared.tim1_ch1_enabled.lock(|enabled| *enabled) {
                               apply_pwm_duty(
