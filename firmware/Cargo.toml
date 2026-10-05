@@ -3,6 +3,15 @@ name = "rt-interrupts"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "rt_interrupts"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rt-interrupts"
+path = "src/main.rs"
+test = false
+
 [dependencies]
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 cortex-m-rt = "0.7"

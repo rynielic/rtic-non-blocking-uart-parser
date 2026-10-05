@@ -1,11 +1,17 @@
 #![no_main]
 #![no_std]
 
+mod command_parser;
+mod pwm_control;
+
 use defmt_rtt as _;
 use panic_probe as _;
 
 #[rtic::app(device = stm32f3xx_hal::pac, dispatchers = [SPI1])]
 mod app {
+      use crate::pwm_control::{set_duty, timer_state, apply_pwm_duty};
+      use crate::command_parser::{parse_command, ParsedCommand, CommandError};
+
       use core::{fmt::Write, sync::atomic::Ordering::Release};
       use defmt::println;
       use heapless::String;
@@ -16,160 +22,13 @@ mod app {
                   Direction::FromPeripheral, 
                   Increment::{Disable, Enable}, 
                   Target
-            }, gpio::Edge, pac::{CRC, DMA1, EXTI, RCC, TIM3, USART1}, prelude::*, serial::{Event, Serial},
+            }, 
+            gpio::Edge, 
+            pac::{CRC, DMA1, EXTI, RCC, TIM3, USART1}, prelude::*, serial::{Event, Serial},
       };
 
       type Uart1TxPin = stm32f3xx_hal::gpio::Pin<stm32f3xx_hal::gpio::Gpioc, stm32f3xx_hal::gpio::U<4>, stm32f3xx_hal::gpio::Alternate<stm32f3xx_hal::gpio::PushPull, 7>>;
       type Uart1RxPin = stm32f3xx_hal::gpio::Pin<stm32f3xx_hal::gpio::Gpioc, stm32f3xx_hal::gpio::U<5>, stm32f3xx_hal::gpio::Alternate<stm32f3xx_hal::gpio::PushPull, 7>>;
-
-      enum CommandError {
-            EmptyArgument,
-            InvalidArgument,
-            ArgumentTooLong,
-            UnknownCommand,
-            PwmStopped,
-            BufferOverflow,
-            CommandBusy,
-            CrcMismatch,
-            CrcNotFound,
-      }
-      impl CommandError {
-            fn message (&self) -> &'static str {
-                  match self {
-                        CommandError::EmptyArgument => "Error: Argument can not be empty!\r\n",
-                        CommandError::InvalidArgument => "Error: Wrong argument!\r\n",
-                        CommandError::ArgumentTooLong => "Error: Argument is too big!\r\n",
-                        CommandError::UnknownCommand => "Error: Unknown command!\r\n",
-                        CommandError::PwmStopped => "Error: Unable to set value - PWM is stopped. To continue enter RESUME\r\n",
-                        CommandError::BufferOverflow => "Error: Command too long, buffer cleared!\r\n",
-                        CommandError::CommandBusy => "Error: Busy, command dropped\r\n",
-                        CommandError::CrcMismatch => "Error: CRC mismatch!\r\n",
-                        CommandError::CrcNotFound => "Error: Corrupted data!\r\n",
-                  }
-            }
-      }
-
-      enum ParsedCommand {
-            SetPwm(u8),
-            Stop,
-            Resume,
-            DropArg,
-            Status,
-            Error(CommandError),
-      }
-
-      fn parse_command (cmd_body: &[u8]) -> ParsedCommand {
-            let cmd = match crc_match(cmd_body) {
-                  Ok(cmd) => cmd,
-                  Err(err) => {
-                        return ParsedCommand::Error(err);
-                  }
-            };
-
-            if let Some(rest) = cmd.strip_prefix(b"SET_PWM(") {
-                  return match rest.iter().position(|br| *br == b')') {
-                        Some(finish) if finish == rest.len() - 1 => parse_pwm_argument(&rest[..finish]),
-                        _ => ParsedCommand::Error(CommandError::UnknownCommand)
-                  };
-            }
-            match cmd {
-                  b"STOP" => ParsedCommand::Stop,
-                  b"RESUME" => ParsedCommand::Resume,
-                  b"DROP_ARG" => ParsedCommand::DropArg,
-                  b"STATUS" => ParsedCommand::Status,
-                  _ => ParsedCommand::Error(CommandError::UnknownCommand),        
-            }
-      }
-
-      fn parse_pwm_argument(argument: &[u8]) -> ParsedCommand {
-            match argument {
-                  [] => ParsedCommand::Error(CommandError::EmptyArgument),
-                  [a] if a.is_ascii_digit() => ParsedCommand::SetPwm(a - b'0'),
-                  [a, b] if a.is_ascii_digit() && b.is_ascii_digit() => ParsedCommand::SetPwm((a - b'0')*10 + b - b'0'),
-                  [b'1', b'0', b'0'] => ParsedCommand::SetPwm(100),
-                  [_] | [_,_] | [_,_,_] => ParsedCommand::Error(CommandError::InvalidArgument), 
-                  _ => ParsedCommand::Error(CommandError::ArgumentTooLong), 
-            }
-      }
-      
-      fn crc_match (cmd_body: &[u8]) -> Result<&[u8], CommandError> {
-            // search for '*'
-            let slice_index = match cmd_body.iter().rposition(|ch| *ch == b'*') {
-                  Some(ind) => ind,
-                  _ => return Err(CommandError::CrcNotFound),
-            };
-
-            // Contains the command itself
-            let cmd_slice= &cmd_body[..slice_index];
-            // Contains raw bytes of the checksum
-            let crc_slice = &cmd_body[slice_index + 1..cmd_body.len() - 1];
-            // Formated checsum
-            let expected_checksum = core::str::from_utf8(crc_slice)
-                  .ok()
-                  .and_then(|s| u16::from_str_radix(s, 16).ok());
-
-            unsafe {
-                  // Reset CRC
-                  (*CRC::ptr()).cr.modify(|_, w| w.reset().set_bit());
-                  // Iterate over each byte from the command
-                  for &byte in cmd_slice {
-                        // Write the byte into CRC data register
-                        (*CRC::ptr()).dr8().write(|w| w.dr8().bits(byte));
-                  }
-                  // Read the checksum from CRC data register
-                  let calculated_checksum = ((*CRC::ptr()).dr().read().bits() & 0xFFFF) as u16;
-
-                  if expected_checksum != Some(calculated_checksum) {
-                        return Err(CommandError::CrcMismatch)
-                  }
-                  Ok(cmd_slice)
-            }
-      }
-
-      fn apply_pwm_duty (
-            mut pwm_duty: impl rtic::Mutex<T = u8>,
-            mut pwm_change_flag: impl rtic::Mutex<T = bool>,
-            value: u8,
-      ) {
-            pwm_duty.lock(|duty| *duty = value);   
-            pwm_change_flag.lock(|flag| *flag = true);
-      }
-
-      fn timer_state(state: bool) {
-            unsafe {
-                  if state {
-                        // Restore PWM Mode 1
-                        (*TIM3::ptr()).ccmr1_output().modify(|_, w| w.oc1m().pwm_mode1());  
-                        // Restart the counter
-                        (*TIM3::ptr()).cr1.modify(|_, w| w.cen().enabled());
-                        return;
-                  }
-                  // Stop the counter (saves power)
-                  (*TIM3::ptr()).cr1.modify(|_, w| w.cen().disabled());
-                  // Actively force the output pin LOW (0V)
-                  (*TIM3::ptr()).ccmr1_output().modify(|_, w| w.oc1m().force_inactive());
-                  // Reset counter to 0 so next start begins at the phase start
-                  (*TIM3::ptr()).cnt.write(|w| w.bits(0));
-            }
-      }
-
-      fn set_duty(duty: u8) {
-            unsafe {
-                  if duty == 0 {
-                        // Change duty
-                        (*TIM3::ptr()).ccr1().write(|w| w.ccr().bits(duty as u16));
-                        // Stop the counter (saves power)
-                        timer_state(false);
-                        return;
-                  }
-                  // Change duty
-                  (*TIM3::ptr()).ccr1().write(|w| w.ccr().bits(duty as u16));
-                  // Force immediate transfer from preload to active shadow register
-                  (*TIM3::ptr()).egr.write(|w| w.ug().set_bit());
-
-                  timer_state(true);
-            }
-      }
       
       #[shared]
       struct Shared {
