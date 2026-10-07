@@ -55,8 +55,6 @@ fn pick_port() -> SerialPortInfo {
                     io::stdout().flush().unwrap();
                     io::stdin().read_line(&mut port_input).unwrap();
 
-
-
                     // Parse keyboard input
                     match port_input.trim().parse::<usize>() {
                         // Return the selected port
@@ -72,8 +70,6 @@ fn pick_port() -> SerialPortInfo {
                             eprintln!("Error: please enter a number!");
                         }
                     };
-
-                    
                 }
             }
             Err(e) => {
@@ -122,7 +118,7 @@ fn main() {
         // READ thread
         let reader_handle = thread::spawn(move || {
             let mut rx_line: [u8; 32] = [0; 32];
-            // Check the falg on every iteration:
+            // Check the flag on every iteration:
             while !stop_reader_clone.load(Relaxed) {
                 match rx_port.read(rx_line.as_mut_slice()) {
                     Ok(t) => {

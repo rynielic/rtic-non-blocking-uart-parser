@@ -1,3 +1,4 @@
+use defmt::println;
 #[cfg(not(test))]
 use stm32f3xx_hal::pac::CRC;
 
@@ -117,7 +118,10 @@ fn crc_match (cmd_body: &[u8]) -> Result<&[u8], CommandError> {
     // search for '*'
     let slice_index = match cmd_body.iter().rposition(|ch| *ch == b'*') {
         Some(ind) => ind,
-        _ => return Err(CommandError::CrcNotFound),
+        _ => {
+            println!("Error: CRC not found!"); 
+            return Err(CommandError::CrcNotFound)
+        }
     };
 
     if slice_index == 0 {
@@ -135,6 +139,7 @@ fn crc_match (cmd_body: &[u8]) -> Result<&[u8], CommandError> {
 
     let calulated_checksum = calculate_crc(cmd_slice);
     if expected_checksum != Some(calulated_checksum) {
+        println!("Error: CRC mismatch!");
         return Err(CommandError::CrcMismatch)
     }
     Ok(cmd_slice)

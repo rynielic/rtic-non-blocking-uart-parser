@@ -150,7 +150,7 @@ mod app {
                         w.arpe().enabled();
                         w.cms().edge_aligned();
                         w.dir().up();
-                        w.cen().enabled()
+                        w.cen().disabled()
                   });
             }
             
@@ -188,7 +188,7 @@ mod app {
                   });
                   if changed {
                         cx.shared.pwm_duty.lock(|pwm_duty| {
-                              println!("applying duty: {}", *pwm_duty);
+                              println!("applying duty: {}", pwm_duty);
                               set_duty(*pwm_duty);
                         })
                   }
@@ -199,7 +199,6 @@ mod app {
 
       #[task(binds = USART1_EXTI25, priority = 2, shared = [uart1], local = [last_cndtr, rx_buffer_length, rx_buffer_addr, cmd_index, cmd])]
       fn uart_rx (mut cx: uart_rx::Context) {
-
             // Clear USART1_IDLE interrupt 
             unsafe { (*USART1::ptr()).icr.write(|w| w.idlecf().set_bit()) };
 
