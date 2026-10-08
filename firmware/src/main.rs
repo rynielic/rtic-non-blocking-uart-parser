@@ -259,7 +259,11 @@ mod app {
                   *enabled = false;
             });
 
-            // unsafe to clear EXTI0 interrupt
+            // unsafe to clear EXTI0 interrupt,
+            // so this task dies and idle task
+            // occurs.
+            // because we set the enabled flag
+            // false, MCU just enters Sleep Mode
             unsafe { (*EXTI::ptr()).pr1.write(|w| w.pr0().set_bit()); }
       }
 

@@ -82,7 +82,19 @@ fn pick_port() -> SerialPortInfo {
 }
 
 fn main() {
-    println!("\r- - - - - - - - - - - - -\r\nHelp: press Ctrl + C to quit or Ctrl + D to flush input buffer\r\n- - - - - - - - - - - - -\r\n");
+    println!(
+        "\r\n
+        - - - - - - - - - - - - -\r\n
+        Help: you can type in upper of lower cases\r\n
+        Available commands:\r\n
+        SET_PWM(arg) - Sets the PWM duty cycle depending on the value of `arg` and should be only integer in range 0..=100\r\n
+        STOP - Stops the PWM entirely, so the next incoming `SET_PWM()` command can't be executed until PWM is resumed\r\n
+        RESUME - Resumes the PWM\r\n
+        DROP_ARG - Sets the PWM argument to 0. Works even while in the stop state\r\n
+        STATUS - Shows the system's status: current state and PWM\r\n
+        Press Ctrl + C to quit\r\n
+        - - - - - - - - - - - - -\r\n"
+    );
     loop {
         // Declare the found port
         let port = pick_port().port_name;

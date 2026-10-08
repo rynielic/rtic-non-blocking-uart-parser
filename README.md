@@ -1,11 +1,11 @@
 A non-blocking, interrupt-driven UART parser with a CRC16 implementation, operating a heater via PWM on a bare-metal STM32F3Discovery board. Built in Rust with the RTIC framework, using the HAL only partially (DMA, PWM, CRC16, and EXTI0 interrupt-flag clearing are implemented via direct register access).
 
 ## What it does
----
+
 The system parses a command such as `SET_PWM(100)`, sent by an operator who typed it into the host script's serial terminal. Before executing the command, the system compares two checksums: one calculated on the host side, which is assumed correct since it reflects exactly what the operator typed, and another received by the MCU over UART and computed via the hardware CRC peripheral. If they match, the system accepts the command and drives the heater using a hardware timer; otherwise it rejects the command and reports a CRC error, which is also duplicated in the RTT console. To stop execution, the operator must send the `STOP` command over the serial terminal or press the physical emergency stop button, which generates an interrupt-driven event.
 
-## Hardware
----
+## Hardware (prototype-grade)
+
 During the build, the electronic circuit was developed using the following parts list:
 * STM32F3Discovery board
 * IRLB8721 MOSFET
@@ -19,8 +19,10 @@ During the build, the electronic circuit was developed using the following parts
 
 **Wiring reasoning:** common ground between the MCU and the isolated supply, a protective diode across the heater/Drain path, R1 limiting gate current, and R2 holding the gate at a safe default before firmware configures the pins. A MOSFET was chosen over a BJT specifically because logic-level gate drive allows direct GPIO control through a simple resistor network, avoiding the extra base-driver stage a BJT would require at this current level.
 
+**Safety notice:** the supply's primary side is 220 V mains, and the circuit has no fuse or over-temperature cutoff. **Never leave unattended.**
+
 ## Architecture
----
+
 A task with the highest priority can preempt a lower one.
 - **idle** - sets the duty cycle by writing the value into the `TIMx_CCR1` register and executes the `WFI` (wait for interrupt) instruction to enter Sleep mode.
 - **uart_parser** (priority 1) - a software async task that parses the received line and applies the corresponding command.
@@ -28,7 +30,7 @@ A task with the highest priority can preempt a lower one.
 - **stop_button** (priority 3) - a hardware task that preempts any other task when the EXTI0 interrupt fires. This task stops the PWM by forcing the output pin LOW. EXTI0 fires if the emergency stop button is pressed or the `STOP` command is sent. Once the task returns, execution falls back to whichever lower-priority task was preempted - typically `idle`, which re-enters Sleep mode via `WFI`.
 
 ## Why no HAL
----
+
 Several modules were implemented via direct register access because the HAL either doesn't provide the necessary functionality at all, or its implementation is deprecated and flagged as unsafe.
 ### DMA
 The HAL's API only supports fixed-length buffers, but the system is designed to handle variable-length buffers via circular DMA mode, which reduces CPU overhead.
@@ -38,7 +40,7 @@ There is no HAL implementation for the CRC peripheral at all. The CRC register b
 Since the HAL's maintainers themselves state that the PWM implementation "is hard to maintain and not easy to verify if it is really a safe implementation," a decision was made to configure PWM directly using the TIMx registers.
 
 ## Command protocol
----
+
 An operator can type commands in upper or lower case - the command is automatically converted to upper case.
 ### List of commands:
 
@@ -53,11 +55,11 @@ An operator can type commands in upper or lower case - the command is automatica
 Before transmission, the checksum calculated on the host side is appended to the command using a `*XXXX` suffix, where `XXXX` is a four-digit hexadecimal number. It uses the standard CRC-16/CCITT-FALSE algorithm to detect data corruption - a real failure mode that was actually observed during debugging, caused by a loose dupont-wire connection.
 
 ## Safety design
----
+
 The program provides a stop button design that acts as an emergency switch: if the button is pressed, the system interrupts the execution of any command. The `STOP` command does exactly the same thing. During the stop state, the `SET_PWM` command is unavailable, but `DROP_ARG` still works, letting an operator zero a dangerous duty value before resuming. To make the stop state genuinely safe, the force-inactive PWM mode guarantees the output goes low on stop. To continue operating, the user must send an acknowledgment by transmitting the `RESUME` command over the serial terminal.
 
 ## Companion tool
----
+
 To compute the corresponding checksum on the host side before transmitting a command, it was necessary to implement a serial listener script, where an operator can select their COM port, send commands, and receive feedback interactively. To implement this, a two-thread design was used.
 
 At the start, a list of all available COM ports is provided to the user. After selection, the program is divided into two threads:
@@ -65,7 +67,7 @@ At the start, a list of all available COM ports is provided to the user. After s
 * **Write thread:** sends formatted user input from stdin over the serial terminal. After the operator submits a line, the corresponding checksum is computed on the host side and the formatted line is sent over the serial terminal. Stops the Read thread before exiting or restarting.
 
 ## Build & flash instructions
----
+
 Before building, it's mandatory to install probe-rs first - an embedded debugging toolkit written in Rust.
 
 ```
@@ -124,7 +126,7 @@ tmux new-session -d -s build \; send-keys 'cd firmware && cargo run --release' C
 ```
 
 ## Testing
----
+
 The first hardware tests were conducted using the on-board LED and the HAL's PWM function on TIM1. This covered the core program logic, including UART transmission/reception, DMA writes, emergency stop handling, command parsing, and PWM output.
 
 For the final tests, the electronic circuit with the heater was soldered, the HAL's PWM function was abandoned, and TIM3 was configured directly, with the related PWM logic refactored accordingly.
@@ -134,7 +136,7 @@ To catch parsing edge cases, unit tests were written using Rust's own built-in t
 **Not all edge cases of the serial listener script are covered by tests**, as this falls outside the project's scope.
 
 ## What was hard / known limitations
----
+
 This section covers problems encountered during the project's development:
 * **RXNE vs. IDLE interrupt misunderstanding** - at the very start, the system was designed to handle the RXNE interrupt (receive-data-register-not-empty, meaning a byte is ready to read), but this approach was rejected due to the CPU overhead of triggering an interrupt on every byte.
 * **Static buffer size selection** - the current implementation trades a small amount of extra SRAM for reduced interrupt-driven CPU overhead, since the extra SRAM usage is negligible. A smaller buffer is possible, but it would increase CPU involvement.
@@ -149,6 +151,6 @@ Known limitations:
 * Spurious `uart_rx` firing right after `init` - does not affect normal operation, but the root cause hasn't been fully diagnosed yet.
 
 ## Possible future work
----
+
 - DMA-based CRC computation: ST documents this as a memory-to-memory back-to-back DMA transfer into `CRC_DR` (see AN4187). Their own benchmarks show a real benefit at large buffer sizes (8192 words: CPU load drops from 100% to 0.72%), but the fixed DMA setup/teardown cost likely outweighs the gain at this project's ~32-byte command buffer. Worth revisiting if buffer sizes grow significantly.
-- A safe Rust API over the unsafe C CAN driver core planned for Build 3, with a correctly handled `#[repr(C)]` boundary.
+- A safe Rust API over the unsafe C CAN driver core with a correctly handled `#[repr(C)]` boundary.
