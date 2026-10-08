@@ -72,16 +72,18 @@ At the start, a list of all available COM ports is provided to the user. After s
 
 ## Build & flash instructions
 
-Before building, it's mandatory to install probe-rs first - an embedded debugging toolkit written in Rust.
+Before building, you should install official rust toolchain. Check this guide: https://rust-lang.org/tools/install/
 
-```
-cargo binstall probe-rs-tools
-```
-
-If you have a working Rust toolchain, you can just run this command:
+Also, it's mandatory to install probe-rs first - an embedded debugging toolkit written in Rust. Run the command below to download it from source:
 
 ```
 cargo install probe-rs-tools --locked
+```
+
+You can also use cargo package manager
+
+```
+cargo binstall probe-rs-tools
 ```
 
 For any help, visit probe-rs' official installation page:
