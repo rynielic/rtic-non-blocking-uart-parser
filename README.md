@@ -15,7 +15,9 @@ During the build, the electronic circuit was developed using the following parts
 * 10 kΩ and 220 Ω resistors
 * Perfboard
 
-![Circuit diagram](circuit.png)
+![Circuit diagram](assets/circuit.png)
+
+![Assembled prototype](assets/assembled_prototype.jpg)
 
 **Wiring reasoning:** common ground between the MCU and the isolated supply, a protective diode across the heater/Drain path, R1 limiting gate current, and R2 holding the gate at a safe default before firmware configures the pins. A MOSFET was chosen over a BJT specifically because logic-level gate drive allows direct GPIO control through a simple resistor network, avoiding the extra base-driver stage a BJT would require at this current level.
 
@@ -154,3 +156,7 @@ Known limitations:
 
 - DMA-based CRC computation: ST documents this as a memory-to-memory back-to-back DMA transfer into `CRC_DR` (see AN4187). Their own benchmarks show a real benefit at large buffer sizes (8192 words: CPU load drops from 100% to 0.72%), but the fixed DMA setup/teardown cost likely outweighs the gain at this project's ~32-byte command buffer. Worth revisiting if buffer sizes grow significantly.
 - A safe Rust API over the unsafe C CAN driver core with a correctly handled `#[repr(C)]` boundary.
+
+## Showcase
+
+![Showcase](assets/showcase.gif)
