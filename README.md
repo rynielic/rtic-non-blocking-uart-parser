@@ -19,6 +19,8 @@ During the build, the electronic circuit was developed using the following parts
 
 ![Assembled prototype](assets/assembled_prototype.jpg)
 
+Left: heater; center: assembled perfboard; right: STM32F3Discovery board
+
 **Wiring reasoning:** common ground between the MCU and the isolated supply, a protective diode across the heater/Drain path, R1 limiting gate current, and R2 holding the gate at a safe default before firmware configures the pins. A MOSFET was chosen over a BJT specifically because logic-level gate drive allows direct GPIO control through a simple resistor network, avoiding the extra base-driver stage a BJT would require at this current level.
 
 **Safety notice:** the supply's primary side is 220 V mains, and the circuit has no fuse or over-temperature cutoff. **Never leave unattended.**
